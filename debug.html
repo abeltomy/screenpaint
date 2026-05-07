@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Hand Gesture Debug — TouchDesigner-style Web</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    background: #0b0f14;
+    color: #d6e1ec;
+    overflow: hidden;
+  }
+  .stage {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  /* Mirror webcam so it behaves like a mirror */
+  #video, #canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1);
+  }
+  #video { visibility: hidden; }
+  .hud {
+    position: absolute;
+    top: 16px;
+    left: 16px;
+    background: rgba(10, 14, 20, 0.7);
+    border: 1px solid #1f2a36;
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-size: 12px;
+    line-height: 1.5;
+    backdrop-filter: blur(6px);
+    max-width: 320px;
+  }
+  .hud h1 { font-size: 13px; margin-bottom: 6px; color: #7cd1ff; }
+  .row { display: flex; justify-content: space-between; gap: 12px; }
+  .row span:last-child { color: #9bffb0; }
+  .pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: #11202b;
+    border: 1px solid #1f3645;
+    color: #7cd1ff;
+    font-size: 11px;
+    margin-top: 6px;
+  }
+  .err {
+    color: #ff8b8b;
+    margin-top: 6px;
+    white-space: pre-wrap;
+  }
+  .footer {
+    position: absolute;
+    bottom: 12px;
+    left: 16px;
+    font-size: 11px;
+    opacity: 0.6;
+  }
+</style>
+</head>
+<body>
+  <div class="stage">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="canvas"></canvas>
+
+    <div class="hud">
+      <h1>Hand Debug</h1>
+      <div class="row"><span>Status</span><span id="status">booting…</span></div>
+      <div class="row"><span>FPS</span><span id="fps">—</span></div>
+      <div class="row"><span>Hands</span><span id="count">0</span></div>
+      <div class="row"><span>Gesture</span><span id="gesture">—</span></div>
+      <div class="row"><span>Pinch dist</span><span id="pinch">—</span></div>
+      <div class="pill">MediaPipe Hands · debug build</div>
+      <div id="err" class="err"></div>
+    </div>
+
+    <div class="footer">Press <b>D</b> to toggle landmark IDs · <b>S</b> to log state</div>
+  </div>
+
+<script src="vendor/camera_utils/camera_utils.js"></script>
+<script src="vendor/drawing_utils/drawing_utils.js"></script>
+<script src="vendor/hands/hands.js"></script>
+<script>
+  const video    = document.getElementById('video');
+  const canvas   = document.getElementById('canvas');
+  const ctx      = canvas.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const fpsEl    = document.getElementById('fps');
+  const countEl  = document.getElementById('count');
+  const gestEl   = document.getElementById('gesture');
+  const pinchEl  = document.getElementById('pinch');
+  const errEl    = document.getElementById('err');
+
+  let showIds = false;
+  let lastState = null;
+  let lastTs = performance.now();
+  let fps = 0;
+
+  function fitCanvas() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  window.addEventListener('resize', fitCanvas);
+  fitCanvas();
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'd' || e.key === 'D') showIds = !showIds;
+    if (e.key === 's' || e.key === 'S') console.log('STATE', lastState);
+  });
+
+  // --- Gesture helpers ------------------------------------------------------
+  // Landmarks: 0 wrist, 4 thumb tip, 8 index tip, 12 middle tip,
+  //            16 ring tip, 20 pinky tip. Each finger has 4 points.
+  function dist(a, b) {
+    const dx = a.x - b.x, dy = a.y - b.y, dz = (a.z || 0) - (b.z || 0);
+    return Math.hypot(dx, dy, dz);
+  }
+  function fingerExtended(lm, tip, pip) {
+    // y is normalized: smaller = higher on screen
+    return lm[tip].y < lm[pip].y;
+  }
+  function classifyGesture(lm) {
+    const idx  = fingerExtended(lm, 8, 6);
+    const mid  = fingerExtended(lm, 12, 10);
+    const rng  = fingerExtended(lm, 16, 14);
+    const pky  = fingerExtended(lm, 20, 18);
+    const pinch = dist(lm[4], lm[8]);
+    if (pinch < 0.05) return { name: 'pinch', pinch };
+    if (idx && mid && rng && pky) return { name: 'open palm', pinch };
+    if (!idx && !mid && !rng && !pky) return { name: 'fist', pinch };
+    if (idx && !mid && !rng && !pky) return { name: 'point', pinch };
+    if (idx && mid && !rng && !pky) return { name: 'peace', pinch };
+    return { name: 'unknown', pinch };
+  }
+
+  // --- Drawing --------------------------------------------------------------
+  function draw(results) {
+    ctx.save();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Draw the camera frame so we can actually see something.
+    // results.image is the frame MediaPipe just processed.
+    if (results.image) {
+      ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+    }
+
+    const hands = results.multiHandLandmarks || [];
+    countEl.textContent = hands.length;
+
+    if (hands.length === 0) {
+      gestEl.textContent = '—';
+      pinchEl.textContent = '—';
+    }
+
+    hands.forEach((lm, i) => {
+      const handedness = (results.multiHandedness && results.multiHandedness[i]) || {};
+      const label = handedness.label || 'Hand';
+
+      // landmarks/connectors are drawn on the (mirrored) canvas
+      drawConnectors(ctx, lm, Hands.HAND_CONNECTIONS,
+                     { color: '#7cd1ff', lineWidth: 3 });
+      drawLandmarks(ctx, lm,
+                    { color: '#9bffb0', lineWidth: 1, radius: 3 });
+
+      const g = classifyGesture(lm);
+      if (i === 0) {
+        gestEl.textContent = `${label} · ${g.name}`;
+        pinchEl.textContent = g.pinch.toFixed(3);
+      }
+
+      if (showIds) {
+        ctx.fillStyle = '#fff';
+        ctx.font = '10px monospace';
+        // Counter the canvas mirroring so text reads normally
+        ctx.save();
+        ctx.scale(-1, 1);
+        lm.forEach((p, idx) => {
+          const x = -p.x * canvas.width;
+          const y = p.y * canvas.height;
+          ctx.fillText(idx, x + 4, y - 4);
+        });
+        ctx.restore();
+      }
+
+      lastState = { label, gesture: g.name, pinch: g.pinch, landmarks: lm };
+    });
+
+    ctx.restore();
+
+    const now = performance.now();
+    const dt = now - lastTs;
+    lastTs = now;
+    fps = 0.9 * fps + 0.1 * (1000 / dt);
+    fpsEl.textContent = fps.toFixed(1);
+  }
+
+  // --- MediaPipe wiring -----------------------------------------------------
+  function showError(msg) {
+    errEl.textContent = msg;
+    statusEl.textContent = 'error';
+    console.error(msg);
+  }
+
+  async function start() {
+    try {
+      statusEl.textContent = 'loading model…';
+      const hands = new Hands({
+        locateFile: (file) => `vendor/hands/${file}`,
+      });
+      hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.6,
+        minTrackingConfidence: 0.5,
+      });
+      hands.onResults(draw);
+
+      statusEl.textContent = 'requesting camera…';
+      const camera = new Camera(video, {
+        onFrame: async () => { await hands.send({ image: video }); },
+        width: 1280,
+        height: 720,
+      });
+      await camera.start();
+      statusEl.textContent = 'running';
+    } catch (e) {
+      showError(`${e.name || 'Error'}: ${e.message || e}`);
+    }
+  }
+
+  // Some browsers block camera unless served over http(s) + user gesture.
+  // file:// often fails — see README for how to run a tiny local server.
+  if (location.protocol === 'file:') {
+    showError('Open this page through a local web server (see README). file:// will block the webcam.');
+  } else {
+    start();
+  }
+</script>
+</body>
+</html>

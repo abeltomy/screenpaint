@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Hand Spray Wall</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; }
+  body {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    background: #000;
+    color: #d6e1ec;
+    overflow: hidden;
+    cursor: none;
+  }
+  #stage {
+    position: fixed;
+    inset: 0;
+  }
+  /* Mirror everything for "selfie" preview. Toggle off in projector mode. */
+  body.mirror #stage { transform: scaleX(-1); }
+  canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+  #bg     { z-index: 1; opacity: 0.55; }      /* webcam, dimmed */
+  #paint  { z-index: 2; }                      /* persistent paint */
+  #overlay{ z-index: 3; pointer-events: none; }/* reticle, skeleton, calib */
+  body.projector #bg { display: none; }
+  body.projector #overlay { opacity: 0.0; }    /* still drawn for cursor */
+  body.projector #overlay.show-cursor { opacity: 1; }
+
+  .hud {
+    position: fixed;
+    top: 12px;
+    left: 12px;
+    z-index: 10;
+    background: rgba(10, 14, 20, 0.78);
+    border: 1px solid #1f2a36;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 12px;
+    line-height: 1.55;
+    max-width: 360px;
+    backdrop-filter: blur(6px);
+  }
+  body.projector .hud { display: none; }
+  .hud h1 { font-size: 13px; color: #7cd1ff; margin-bottom: 4px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; }
+  .row span:last-child { color: #9bffb0; }
+  .swatches { display: flex; gap: 6px; margin-top: 6px; }
+  .sw {
+    width: 18px; height: 18px; border-radius: 4px;
+    border: 1px solid #2a3845; cursor: pointer;
+  }
+  .sw.active { outline: 2px solid #fff; outline-offset: 1px; }
+  .brushes { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
+  .br {
+    padding: 3px 7px; border: 1px solid #2a3845; border-radius: 6px;
+    color: #b9c8d6; background: #11202b; cursor: pointer; font-size: 11px;
+  }
+  .br.active { background: #1d3a4d; color: #fff; border-color: #3b6a86; }
+  .keys { color: #8ea2b3; margin-top: 6px; font-size: 11px; }
+  .err { color: #ff8b8b; margin-top: 6px; white-space: pre-wrap; }
+
+  /* Calibration overlay banner */
+  .banner {
+    position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    background: #ffcc33; color: #111; padding: 6px 12px; border-radius: 8px;
+    font-size: 12px; font-weight: 600; z-index: 11; display: none;
+  }
+  body.calibrating .banner { display: block; }
+</style>
+</head>
+<body class="mirror">
+  <div id="stage">
+    <video id="video" autoplay muted playsinline style="display:none"></video>
+    <canvas id="bg"></canvas>
+    <canvas id="paint"></canvas>
+    <canvas id="overlay" class="show-cursor"></canvas>
+  </div>
+
+  <div class="banner" id="banner">Click TL → TR → BR → BL of the projected area</div>
+
+  <div class="hud">
+    <h1>Hand Spray Wall</h1>
+    <div class="row"><span>Status</span><span id="status">booting…</span></div>
+    <div class="row"><span>FPS</span><span id="fps">—</span></div>
+    <div class="row"><span>Hands</span><span id="count">0</span></div>
+    <div class="row"><span>Gesture</span><span id="gesture">—</span></div>
+    <div class="row"><span>Brush</span><span id="brushinfo">—</span></div>
+    <div class="swatches" id="swatches"></div>
+    <div class="brushes" id="brushes"></div>
+    <div class="keys">
+      [ / ] size · - / = opacity · 1–8 color · B brush<br>
+      Space clear · S save · P projector · M mirror<br>
+      T trigger (pinch/point/always) · K calibrate (4 corners)
+    </div>
+    <div id="err" class="err"></div>
+  </div>
+
+<script src="vendor/camera_utils/camera_utils.js"></script>
+<script src="vendor/drawing_utils/drawing_utils.js"></script>
+<script src="vendor/hands/hands.js"></script>
+<script>
+'use strict';
+
+// ---------- elements / state -------------------------------------------------
+const video = document.getElementById('video');
+const bg    = document.getElementById('bg');
+const paint = document.getElementById('paint');
+const ov    = document.getElementById('overlay');
+const bgCtx = bg.getContext('2d');
+const pCtx  = paint.getContext('2d');
+const oCtx  = ov.getContext('2d');
+const statusEl = document.getElementById('status');
+const fpsEl  = document.getElementById('fps');
+const countEl= document.getElementById('count');
+const gestEl = document.getElementById('gesture');
+const brushInfo = document.getElementById('brushinfo');
+const errEl  = document.getElementById('err');
+const banner = document.getElementById('banner');
+
+const PALETTE = ['#ff3366','#ffaa00','#ffee33','#33ee66','#33ccff','#aa33ff','#ffffff','#000000'];
+let brush = { color: PALETTE[0], size: 90, opacity: 0.18, particles: 26, spread: 0.8 };
+let mode  = { projector: false, mirror: true, triggerStyle: 'pinch' };
+let homography = null;        // 3x3 row-major or null = identity
+let calPoints = [];           // collected during calibration
+let calibrating = false;
+let lastTs = performance.now();
+let fps = 0;
+let lastNozzle = null;        // for stroke smoothing
+let wasFist = false;          // debounce fist → color change
+let peaceStart = null;        // timestamp when peace began (null = not holding)
+
+// ---------- canvas sizing (preserve paint!) ---------------------------------
+function fit() {
+  const w = innerWidth, h = innerHeight;
+  // snapshot existing paint so resize doesn't wipe it
+  const tmp = document.createElement('canvas');
+  tmp.width = paint.width || w;
+  tmp.height = paint.height || h;
+  if (paint.width && paint.height) tmp.getContext('2d').drawImage(paint, 0, 0);
+  for (const c of [bg, paint, ov]) { c.width = w; c.height = h; }
+  pCtx.drawImage(tmp, 0, 0, tmp.width, tmp.height, 0, 0, w, h);
+}
+addEventListener('resize', fit); fit();
+
+// ---------- swatches UI -----------------------------------------------------
+const swatches = document.getElementById('swatches');
+PALETTE.forEach((c, i) => {
+  const el = document.createElement('div');
+  el.className = 'sw' + (i === 0 ? ' active' : '');
+  el.style.background = c;
+  el.title = `${i+1}: ${c}`;
+  el.addEventListener('click', () => setColor(i));
+  swatches.appendChild(el);
+});
+function setColor(i) {
+  brush.color = PALETTE[i];
+  swatches.querySelectorAll('.sw').forEach((el, j) => el.classList.toggle('active', j === i));
+  updateBrushInfo();
+}
+function updateBrushInfo() {
+  brushInfo.textContent = `${currentBrush().name} · ${brush.color} · ${brush.size|0}px · α${brush.opacity.toFixed(2)} · ${mode.triggerStyle}`;
+}
+
+// ---------- math: homography (4-pt) -----------------------------------------
+function solveLinear(A, b) {
+  const n = A.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col+1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+    [M[col], M[piv]] = [M[piv], M[col]];
+    const div = M[col][col];
+    if (Math.abs(div) < 1e-10) throw new Error('singular');
+    for (let c = col; c <= n; c++) M[col][c] /= div;
+    for (let r = 0; r < n; r++) if (r !== col) {
+      const f = M[r][col];
+      for (let c = col; c <= n; c++) M[r][c] -= f * M[col][c];
+    }
+  }
+  return M.map(row => row[n]);
+}
+function homography4pt(src, dst) {
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const {x, y} = src[i], {x: u, y: v} = dst[i];
+    A.push([x, y, 1, 0, 0, 0, -u*x, -u*y]); b.push(u);
+    A.push([0, 0, 0, x, y, 1, -v*x, -v*y]); b.push(v);
+  }
+  const h = solveLinear(A, b);
+  return [h[0],h[1],h[2], h[3],h[4],h[5], h[6],h[7],1];
+}
+function applyH(p) {
+  if (!homography) return p;
+  const [a,b,c,d,e,f,g,hh,i] = homography;
+  const w = g*p.x + hh*p.y + i;
+  return { x: (a*p.x + b*p.y + c)/w, y: (d*p.x + e*p.y + f)/w };
+}
+
+// ---------- brushes ---------------------------------------------------------
+function hexA(hex, a) {
+  const h = hex.replace('#','');
+  const r = parseInt(h.slice(0,2),16), g = parseInt(h.slice(2,4),16), b = parseInt(h.slice(4,6),16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+// Each brush: { name, step, stamp(ctx, x, y, prev) }
+//   step = factor of brush.size used for spacing along a stroke (smaller = denser)
+const BRUSHES = [
+  { name: 'spray', step: 0.35, stamp(ctx, x, y) {
+      ctx.save();
+      ctx.fillStyle = brush.color;
+      ctx.globalCompositeOperation = 'source-over';
+      const R = brush.size * brush.spread;
+      for (let i = 0; i < brush.particles; i++) {
+        const r = R * Math.sqrt(Math.random());
+        const a = Math.random() * Math.PI * 2;
+        const px = x + Math.cos(a)*r, py = y + Math.sin(a)*r;
+        const dotR = (1 - r/R) * 3.2 + 0.8;
+        ctx.globalAlpha = brush.opacity * (1 - r/R);
+        ctx.beginPath(); ctx.arc(px, py, dotR, 0, Math.PI*2); ctx.fill();
+      }
+      ctx.restore();
+  } },
+
+  { name: 'marker', step: 0.18, stamp(ctx, x, y) {
+      const r = brush.size * 0.5;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      g.addColorStop(0,   hexA(brush.color, brush.opacity));
+      g.addColorStop(0.7, hexA(brush.color, brush.opacity * 0.55));
+      g.addColorStop(1,   hexA(brush.color, 0));
+      ctx.save();
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
+      ctx.restore();
+  } },
+
+  { name: 'pencil', step: 0.5, stamp(ctx, x, y, prev) {
+      ctx.save();
+      ctx.strokeStyle = brush.color;
+      ctx.lineCap = 'round';
+      ctx.lineWidth = Math.max(1, brush.size * 0.05);
+      ctx.globalAlpha = Math.min(1, brush.opacity * 0.9);
+      ctx.beginPath();
+      if (prev) ctx.moveTo(prev.x, prev.y); else ctx.moveTo(x - 0.5, y);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+      ctx.restore();
+  } },
+
+  { name: 'splatter', step: 0.6, stamp(ctx, x, y) {
+      ctx.save();
+      ctx.fillStyle = brush.color;
+      const N = Math.max(3, brush.particles >> 2);
+      for (let i = 0; i < N; i++) {
+        const r = brush.size * Math.pow(Math.random(), 1.8);
+        const a = Math.random() * Math.PI * 2;
+        const px = x + Math.cos(a)*r, py = y + Math.sin(a)*r;
+        const dotR = Math.random() * (brush.size * 0.07) + 1;
+        ctx.globalAlpha = brush.opacity * (0.5 + Math.random()*0.5);
+        ctx.beginPath(); ctx.arc(px, py, dotR, 0, Math.PI*2); ctx.fill();
+      }
+      ctx.restore();
+  } },
+
+  { name: 'crayon', step: 0.25, stamp(ctx, x, y) {
+      ctx.save();
+      ctx.fillStyle = brush.color;
+      const r = brush.size * 0.5;
+      const N = brush.particles + 30;
+      for (let i = 0; i < N; i++) {
+        const u = Math.random();
+        const rad = r * Math.pow(u, 0.7);
+        const a = Math.random() * Math.PI * 2;
+        const px = x + Math.cos(a)*rad, py = y + Math.sin(a)*rad;
+        ctx.globalAlpha = brush.opacity * 0.5 * Math.random();
+        ctx.fillRect(px, py, 1, 1);
+      }
+      ctx.restore();
+  } },
+
+  { name: 'neon', step: 0.2, stamp(ctx, x, y) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const r = brush.size * 0.6;
+      let g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      g.addColorStop(0, hexA(brush.color, brush.opacity));
+      g.addColorStop(1, hexA(brush.color, 0));
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
+      const r2 = r * 0.28;
+      g = ctx.createRadialGradient(x, y, 0, x, y, r2);
+      g.addColorStop(0, hexA('#ffffff', brush.opacity));
+      g.addColorStop(1, hexA(brush.color, 0));
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(x, y, r2, 0, Math.PI*2); ctx.fill();
+      ctx.restore();
+  } },
+
+  { name: 'calligraphy', step: 0.15, stamp(ctx, x, y, prev) {
+      let angle = 0;
+      if (prev) angle = Math.atan2(y - prev.y, x - prev.x);
+      ctx.save();
+      ctx.translate(x, y); ctx.rotate(angle);
+      ctx.fillStyle = brush.color;
+      ctx.globalAlpha = Math.min(1, brush.opacity * 1.4);
+      ctx.beginPath();
+      ctx.ellipse(0, 0, brush.size * 0.5, brush.size * 0.12, 0, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+  } },
+
+  { name: 'eraser', step: 0.25, stamp(ctx, x, y) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'destination-out';
+      const r = brush.size * 0.6;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      g.addColorStop(0, 'rgba(0,0,0,1)');
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
+      ctx.restore();
+  } },
+];
+
+let brushIdx = 0;
+const currentBrush = () => BRUSHES[brushIdx];
+
+function stamp(ctx, x, y, prev) {
+  currentBrush().stamp(ctx, x, y, prev);
+}
+function strokeSegment(ctx, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const d = Math.hypot(dx, dy);
+  const step = Math.max(brush.size * currentBrush().step, 3);
+  const n = Math.max(1, Math.ceil(d / step));
+  let prev = a;
+  for (let i = 1; i <= n; i++) {
+    const t = i / n;
+    const p = { x: a.x + dx*t, y: a.y + dy*t };
+    stamp(ctx, p.x, p.y, prev);
+    prev = p;
+  }
+}
+
+// brush picker UI
+const brushesEl = document.getElementById('brushes');
+BRUSHES.forEach((b, i) => {
+  const el = document.createElement('div');
+  el.className = 'br' + (i === 0 ? ' active' : '');
+  el.textContent = b.name;
+  el.addEventListener('click', () => setBrush(i));
+  brushesEl.appendChild(el);
+});
+function setBrush(i) {
+  brushIdx = i;
+  brushesEl.querySelectorAll('.br').forEach((el, j) => el.classList.toggle('active', j === i));
+  updateBrushInfo();
+}
+updateBrushInfo();
+
+// ---------- gesture classification ------------------------------------------
+function dist(a, b) { return Math.hypot(a.x-b.x, a.y-b.y); }
+function fingerExt(lm, tip, pip) { return lm[tip].y < lm[pip].y; }
+function classify(lm) {
+  const idx = fingerExt(lm, 8, 6);
+  const mid = fingerExt(lm, 12, 10);
+  const rng = fingerExt(lm, 16, 14);
+  const pky = fingerExt(lm, 20, 18);
+  const pinch = dist(lm[4], lm[8]);
+  let name = 'unknown';
+  if (pinch < 0.05) name = 'pinch';
+  else if (idx && mid && rng && pky) name = 'open';
+  else if (!idx && !mid && !rng && !pky) name = 'fist';
+  else if (idx && !mid && !rng && !pky) name = 'point';
+  else if (idx && mid && !rng && !pky) name = 'peace';
+  return { name, pinch, idx, mid, rng, pky };
+}
+function shouldSpray(g) {
+  if (mode.triggerStyle === 'always') return true;
+  if (mode.triggerStyle === 'point')  return g.idx && !g.mid && !g.rng && !g.pky;
+  return g.name === 'pinch';           // default
+}
+
+// ---------- main draw loop --------------------------------------------------
+function onResults(results) {
+  // bg: webcam (dev mode only — invisible in projector mode via CSS)
+  if (results.image) {
+    bgCtx.clearRect(0, 0, bg.width, bg.height);
+    bgCtx.drawImage(results.image, 0, 0, bg.width, bg.height);
+  }
+
+  // overlay
+  oCtx.clearRect(0, 0, ov.width, ov.height);
+
+  const hands = results.multiHandLandmarks || [];
+  countEl.textContent = hands.length;
+
+  // calibration markers
+  if (calibrating) {
+    oCtx.save();
+    oCtx.fillStyle = '#ffcc33';
+    oCtx.strokeStyle = '#ffcc33';
+    oCtx.lineWidth = 2;
+    calPoints.forEach((p, i) => {
+      oCtx.beginPath();
+      oCtx.arc(p.x, p.y, 8, 0, Math.PI*2);
+      oCtx.fill();
+      oCtx.fillText(i+1, p.x+12, p.y-8);
+    });
+    oCtx.restore();
+  }
+
+  if (hands.length === 0) {
+    gestEl.textContent = '—';
+    lastNozzle = null;
+  }
+
+  hands.forEach((lm, hi) => {
+    if (hi === 0) {
+      // skeleton (dev only — projector hides it via CSS)
+      drawConnectors(oCtx, lm, Hands.HAND_CONNECTIONS, { color: '#7cd1ff', lineWidth: 2 });
+      drawLandmarks(oCtx, lm, { color: '#9bffb0', lineWidth: 1, radius: 2 });
+
+      const g = classify(lm);
+      gestEl.textContent = g.name + ' · ' + g.pinch.toFixed(3);
+
+      // fist → advance color (trigger on leading edge only)
+      if (g.name === 'fist') {
+        if (!wasFist) {
+          const nextIdx = (PALETTE.indexOf(brush.color) + 1) % PALETTE.length;
+          setColor(nextIdx);
+        }
+        wasFist = true;
+      } else {
+        wasFist = false;
+      }
+
+      // peace → hold 5 s to clear canvas, show countdown
+      const PEACE_HOLD = 5000;
+      if (g.name === 'peace') {
+        if (peaceStart === null) peaceStart = performance.now();
+        const held = performance.now() - peaceStart;
+        const remaining = Math.ceil((PEACE_HOLD - held) / 1000);
+        if (held >= PEACE_HOLD) {
+          pCtx.clearRect(0, 0, paint.width, paint.height);
+          peaceStart = null;
+        } else {
+          // big countdown drawn on overlay
+          const cx = ov.width / 2, cy = ov.height / 2;
+          const progress = held / PEACE_HOLD;
+          // arc ring
+          oCtx.save();
+          oCtx.lineWidth = 10;
+          oCtx.strokeStyle = 'rgba(255,255,255,0.25)';
+          oCtx.beginPath();
+          oCtx.arc(cx, cy, 90, 0, Math.PI * 2);
+          oCtx.stroke();
+          oCtx.strokeStyle = brush.color;
+          oCtx.beginPath();
+          oCtx.arc(cx, cy, 90, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * progress);
+          oCtx.stroke();
+          // number
+          oCtx.fillStyle = '#ffffff';
+          oCtx.font = 'bold 120px ui-monospace, monospace';
+          oCtx.textAlign = 'center';
+          oCtx.textBaseline = 'middle';
+          oCtx.shadowColor = brush.color;
+          oCtx.shadowBlur = 30;
+          oCtx.fillText(remaining, cx, cy);
+          oCtx.restore();
+        }
+      } else {
+        peaceStart = null;
+      }
+
+      // nozzle = index tip in normalized image space, then mapped through homography
+      const nNorm = applyH({ x: lm[8].x, y: lm[8].y });
+      const nozzle = { x: nNorm.x * paint.width, y: nNorm.y * paint.height };
+
+      // reticle
+      oCtx.save();
+      oCtx.strokeStyle = brush.color;
+      oCtx.lineWidth = 2;
+      oCtx.beginPath();
+      oCtx.arc(nozzle.x, nozzle.y, brush.size * 0.6, 0, Math.PI*2);
+      oCtx.stroke();
+      oCtx.restore();
+
+      if (shouldSpray(g) && !calibrating) {
+        if (lastNozzle && dist(lastNozzle, nozzle) < paint.width * 0.5) {
+          strokeSegment(pCtx, lastNozzle, nozzle);
+        } else {
+          stamp(pCtx, nozzle.x, nozzle.y, null);
+        }
+        lastNozzle = nozzle;
+      } else {
+        lastNozzle = null;
+      }
+
+      // open palm = nothing (could trigger color cycle later)
+    }
+  });
+
+  const now = performance.now();
+  const dt = now - lastTs; lastTs = now;
+  fps = 0.9*fps + 0.1*(1000/dt);
+  fpsEl.textContent = fps.toFixed(1);
+}
+
+// ---------- key bindings ----------------------------------------------------
+addEventListener('keydown', (e) => {
+  const k = e.key;
+  if (/^[1-8]$/.test(k)) setColor(parseInt(k, 10) - 1);
+  else if (k === '[') { brush.size = Math.max(8,  brush.size - 8); updateBrushInfo(); }
+  else if (k === ']') { brush.size = Math.min(300, brush.size + 8); updateBrushInfo(); }
+  else if (k === '-') { brush.opacity = Math.max(0.02, brush.opacity - 0.02); updateBrushInfo(); }
+  else if (k === '=' || k === '+') { brush.opacity = Math.min(1, brush.opacity + 0.02); updateBrushInfo(); }
+  else if (k === ' ') { pCtx.clearRect(0,0,paint.width,paint.height); }
+  else if (k === 's' || k === 'S') saveImage();
+  else if (k === 'p' || k === 'P') { mode.projector = !mode.projector; document.body.classList.toggle('projector', mode.projector); }
+  else if (k === 'm' || k === 'M') { mode.mirror = !mode.mirror; document.body.classList.toggle('mirror', mode.mirror); }
+  else if (k === 't' || k === 'T') {
+    const order = ['pinch','point','always'];
+    mode.triggerStyle = order[(order.indexOf(mode.triggerStyle)+1) % order.length];
+    updateBrushInfo();
+  }
+  else if (k === 'b' || k === 'B') setBrush((brushIdx + 1) % BRUSHES.length);
+  else if (k === 'k' || k === 'K') startCalibration();
+  else if (k === 'Escape') cancelCalibration();
+});
+
+// ---------- calibration -----------------------------------------------------
+function startCalibration() {
+  calibrating = true;
+  calPoints = [];
+  document.body.classList.add('calibrating');
+  banner.textContent = 'Click TL → TR → BR → BL of the projected area';
+}
+function cancelCalibration() {
+  calibrating = false;
+  calPoints = [];
+  document.body.classList.remove('calibrating');
+}
+ov.style.pointerEvents = 'auto';
+ov.addEventListener('click', (e) => {
+  if (!calibrating) return;
+  // event coords are in viewport (post-mirror). Convert to camera-image space.
+  const rect = ov.getBoundingClientRect();
+  let x = (e.clientX - rect.left) / rect.width;
+  if (mode.mirror) x = 1 - x;                 // un-mirror
+  const y = (e.clientY - rect.top) / rect.height;
+  calPoints.push({ x: x * paint.width, y: y * paint.height });
+
+  if (calPoints.length === 4) {
+    // src = camera pixels of the 4 corners (in canvas coords, normalized 0..1)
+    const src = calPoints.map(p => ({ x: p.x / paint.width, y: p.y / paint.height }));
+    const dst = [{x:0,y:0}, {x:1,y:0}, {x:1,y:1}, {x:0,y:1}];
+    try {
+      homography = homography4pt(src, dst);
+      banner.textContent = 'Calibration set. Press K again to redo, Esc to cancel.';
+      setTimeout(() => { calibrating = false; document.body.classList.remove('calibrating'); }, 1200);
+    } catch (err) {
+      banner.textContent = 'Calibration failed (singular). Try again.';
+      calPoints = [];
+    }
+  } else {
+    banner.textContent = `Got ${calPoints.length}/4. Next corner.`;
+  }
+});
+
+// ---------- save ------------------------------------------------------------
+function saveImage() {
+  // composite paint over a black bg so transparency saves cleanly
+  const out = document.createElement('canvas');
+  out.width = paint.width; out.height = paint.height;
+  const c = out.getContext('2d');
+  c.fillStyle = '#000'; c.fillRect(0,0,out.width,out.height);
+  c.drawImage(paint, 0, 0);
+  const a = document.createElement('a');
+  a.href = out.toDataURL('image/png');
+  a.download = 'spray-wall-' + Date.now() + '.png';
+  a.click();
+}
+
+// ---------- start MediaPipe -------------------------------------------------
+function showError(msg) { errEl.textContent = msg; statusEl.textContent = 'error'; console.error(msg); }
+async function start() {
+  try {
+    statusEl.textContent = 'loading model…';
+    const hands = new Hands({ locateFile: (f) => `vendor/hands/${f}` });
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.5,
+    });
+    hands.onResults(onResults);
+
+    statusEl.textContent = 'requesting camera…';
+    const camera = new Camera(video, {
+      onFrame: async () => { await hands.send({ image: video }); },
+      width: 1280, height: 720,
+    });
+    await camera.start();
+    statusEl.textContent = 'running · pinch to spray';
+  } catch (e) {
+    showError(`${e.name || 'Error'}: ${e.message || e}`);
+  }
+}
+if (location.protocol === 'file:') {
+  showError('Open via http://localhost (file:// blocks the webcam).');
+} else {
+  start();
+}
+</script>
+</body>
+</html>
