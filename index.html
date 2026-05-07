@@ -328,7 +328,7 @@ const BRUSHES = [
   } },
 ];
 
-let brushIdx = 0;
+let brushIdx = 1;
 const currentBrush = () => BRUSHES[brushIdx];
 
 function stamp(ctx, x, y, prev) {
@@ -352,7 +352,7 @@ function strokeSegment(ctx, a, b) {
 const brushesEl = document.getElementById('brushes');
 BRUSHES.forEach((b, i) => {
   const el = document.createElement('div');
-  el.className = 'br' + (i === 0 ? ' active' : '');
+  el.className = 'br' + (i === 1 ? ' active' : '');
   el.textContent = b.name;
   el.addEventListener('click', () => setBrush(i));
   brushesEl.appendChild(el);
