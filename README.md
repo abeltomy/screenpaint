@@ -1,28 +1,11 @@
 # HandGesture-Web
 
-Tiny browser-based hand-tracking sandbox to use as a starting point for a
-TouchDesigner-style web project driven by hand movements.
+Tiny browser-based hand-tracking sandbox web project driven by hand movements.
 
 Uses MediaPipe Hands (loaded from a CDN, no install required) and draws the
 21 hand landmarks plus a small debug HUD: FPS, hand count, recognized
 gesture (`open palm`, `fist`, `point`, `peace`, `pinch`), and live pinch
 distance.
-
-## Run it
-
-The page needs a `http://` origin to access the webcam — `file://` will be
-blocked. Start any tiny local server, then open the URL:
-
-Python (already on macOS):
-
-    cd ~/Desktop/Cludecode/HandGesture-Web
-    python3 -m http.server 8000
-
-Then open http://localhost:8000 in Chrome and allow camera access.
-
-Or, with Node:
-
-    npx serve .
 
 ## Debug shortcuts
 
